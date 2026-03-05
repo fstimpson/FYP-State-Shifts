@@ -1,1 +1,603 @@
-## main codespace 
+#main codespace 
+#install.packages("tidyverse")
+library(tidyverse)
+#install.packages("readxl")
+library(readxl)
+#install.packages("here")
+library(here)
+#install.packages("janitor")
+library(janitor)
+#install.packages("dplyr")
+library(dplyr)
+#install.packages("readr")
+library(readr)
+library(tidyr)
+#install.packages("zoo")
+library(zoo)
+#install.packages("ggnewscale")
+library(ggnewscale)
+library(lubridate)
+library(patchwork)
+library(hydroState)
+install.packages("parallelly")
+library(parallelly)
+install.packages("gridExtra")
+rainfall <- read_csv("precipitation_SILO.csv")
+streamflow <- read_csv("streamflow_mmd.csv")
+
+
+streamflow <- streamflow %>%
+mutate(across(where(is.numeric), ~ ifelse(. < 0, NA, .)))  # replace negatives with NA
+
+#View(streamflow)
+
+streamlong <- streamflow %>%
+  pivot_longer(
+    cols = -(1:3),                 # skip Year, Month, Day
+    names_to = "catchment",
+    values_to = "flow_mm"
+  ) %>%
+  mutate(date = make_date(year, month, day))
+
+#View(streamlong)
+
+rainlong <- rainfall %>%
+  pivot_longer(
+    cols = -(c(year, month,day)),   # keep day, month, year; pivot the rest
+    names_to = "catchment",
+    values_to = "precip"
+  ) %>%
+  # create a proper date column
+  mutate(date = make_date(year, month, day))
+
+
+# Join the two data frames by catchment_ID and date
+combined <- streamlong %>%
+  left_join(rainlong, by = c("catchment", "date"))
+
+combined <- combined %>%
+  #mutate(precip = ifelse(precip < 0, NA, precip))
+  filter(precip >= 0) # removes rows <0
+#View(combined) 
+# Function to extract streamflow, precip, and date for one catchment
+extract_catchment_timeseries <- function(combined, catchment_ID) {
+  combined %>%
+    filter(catchment == catchment_ID) %>%   # use the actual column name
+    select(date, flow_mm, precip) %>%
+    arrange(date)
+}
+
+
+
+#Auto VL!!
+
+install.packages("shiny")
+install.packages(("DT"))
+suppressPackageStartupMessages({
+  library(shiny)
+  library(DT)
+})
+
+# Custom validation function
+check_condition <- function(condition, message) {
+  if (!condition) {
+    stop(message)  # Throws an error if the condition fails
+  }
+}
+
+axis_style <- theme(
+  axis.text  = element_text(color = "black", size = 12),
+  axis.title = element_text(color = "black", size = 12),
+  axis.ticks = element_line(color = "black"),
+  axis.line  = element_line(color = "black")
+)
+
+# ---------------------------
+# AutoVL core
+# ---------------------------
+
+new_filt <- function(a, alpha, alpha1) {
+  n <- length(a); if (n == 0) return(a)
+  b <- a; yn <- 0; yold <- 0
+  a1 <- alpha; a2 <- alpha1
+  if (!is.finite(b[1])) b[1] <- 0
+  for (i in 2:n) {
+    dy <- a[i] - a[i - 1]; if (!is.finite(dy)) dy <- 0
+    yn <- a1 * yold + a2 * dy
+    if (yn > a[i]) yn <- a[i]
+    yb <- a[i] - yn
+    if (yb > a[i]) yb <- a[i]
+    if (!is.finite(yb)) yb <- 0
+    yn   <- a[i] - yb
+    yold <- yn
+    b[i] <- yb
+  }
+  b
+}
+
+shift <- function(x, n) {
+  y <- x; N <- length(x)
+  if (N == 0 || n <= 0) return(y)
+  if (n >= N) return(y)
+  y[(n + 1):N] <- x[1:(N - n)]
+  y
+}
+
+# ---------------------------
+# Date parsing helpers
+# ---------------------------
+
+fmt_input <- function(s) {
+  s <- if (is.null(s)) "" else trimws(s)
+  if (identical(s, "")) NA_character_ else s
+}
+
+parse_dates <- function(x, fmt = NA_character_) {
+  x <- as.character(x)
+  x <- trimws(gsub('^"|"$', "", x))
+  if (length(x) == 0) return(as.Date(character()))
+  if (length(x) >= 1) x[1] <- sub("^\ufeff", "", x[1], useBytes = TRUE) # strip BOM
+  
+  # user-specified
+  if (!is.na(fmt) && nzchar(fmt)) {
+    d <- suppressWarnings(as.Date(x, format = fmt))
+    if (!all(is.na(d))) return(d)
+  }
+  
+  # ISO (with or without time suffix)
+  iso_mask <- grepl("^\\d{4}-\\d{2}-\\d{2}([T\\s].*)?$", x)
+  if (any(iso_mask)) {
+    xs <- x
+    xs[iso_mask] <- substr(xs[iso_mask], 1L, 10L)
+    d <- suppressWarnings(as.Date(xs, format = "%Y-%m-%d"))
+    if (!all(is.na(d))) return(d)
+  }
+  
+  # common fmts
+  fmts <- c("%Y-%m-%d","%Y/%m/%d","%d/%m/%Y","%m/%d/%Y","%d-%m-%Y","%m-%d-%Y")
+  for (f in fmts) {
+    d <- suppressWarnings(as.Date(x, format = f))
+    if (!all(is.na(d))) return(d)
+  }
+  
+  # last resort
+  xs <- ifelse(nchar(x) >= 10, substr(x, 1, 10), x)
+  suppressWarnings(as.Date(xs))
+}
+
+# ---------------------------
+# File reader (comments + header auto-detect)
+# ---------------------------
+
+.detect_sep <- function(line) {
+  if (grepl(",", line, fixed = TRUE)) return(",")
+  if (grepl("\t", line)) return("\t")
+  ""  # whitespace
+}
+
+.is_header_line <- function(line) {
+  has_letters <- grepl("[A-Za-z]", line)
+  if (has_letters) return(TRUE)
+  FALSE
+}
+
+read_table_with_comments <- function(path) {
+  raw <- readLines(path, warn = FALSE)
+  if (length(raw) == 0) stop("Empty file.")
+  # skip comments
+  i <- 1L
+  while (i <= length(raw) && grepl("^\\s*#", raw[i])) i <- i + 1L
+  if (i > length(raw)) stop("File has only comment lines.")
+  sep <- .detect_sep(raw[i])
+  
+  header <- .is_header_line(raw[i])
+  txt <- paste0(raw[i:length(raw)], collapse = "\n")
+  con <- textConnection(txt); on.exit(close(con), add = TRUE)
+  
+  if (sep == "") {
+    df <- tryCatch(utils::read.table(con, header = header, sep = "", stringsAsFactors = FALSE,
+                                     check.names = FALSE, comment.char = "", quote = ""),
+                   error = function(e) stop("Failed to parse (whitespace) table: ", conditionMessage(e)))
+  } else {
+    df <- tryCatch(utils::read.table(con, header = header, sep = sep, stringsAsFactors = FALSE,
+                                     check.names = FALSE, comment.char = "", quote = "\""),
+                   error = function(e) stop("Failed to parse table: ", conditionMessage(e)))
+  }
+  
+  if (ncol(df) < 2) stop("Input must have at least 2 columns (Date, TotalFlow).")
+  
+  # If no header but first row looks like labels, drop it
+  first1 <- as.character(df[[1]][1])
+  first2 <- as.character(df[[2]][1])
+  looks_like_header <- grepl("date", first1, ignore.case = TRUE) ||
+    grepl("flow|discharge|total", first2, ignore.case = TRUE)
+  if (!header && looks_like_header) {
+    df <- df[-1, , drop = FALSE]
+  }
+  
+  df
+}
+
+# ---------------------------
+# Safe regressions + single-pass runner
+# ---------------------------
+
+safe_blm <- function(B, B1, F1) {
+  df <- data.frame(B = B, B1 = B1, F1 = F1)
+  if (nrow(df) < 2L) return(list(coef = c(B1 = NA_real_, F1 = NA_real_), adjr2 = NA_real_, ok = FALSE))
+  df <- df[-1, , drop = FALSE]
+  df <- df[is.finite(rowSums(df)), , drop = FALSE]
+  if (nrow(df) < 5L) return(list(coef = c(B1 = NA_real_, F1 = NA_real_), adjr2 = NA_real_, ok = FALSE))
+  fit <- try(lm(B ~ -1 + B1 + F1, data = df), silent = TRUE)
+  if (!inherits(fit, "try-error") && !is.na(summary(fit)$r.squared)) {
+    bc <- coef(fit)
+    return(list(
+      coef  = c(B1 = unname(ifelse("B1" %in% names(bc), bc["B1"], NA_real_)),
+                F1 = unname(ifelse("F1" %in% names(bc), bc["F1"], NA_real_))),
+      adjr2 = summary(fit)$adj.r.squared,
+      ok    = TRUE
+    ))
+  }
+  fit2 <- try(lm(B ~ -1 + B1, data = df), silent = TRUE)
+  if (!inherits(fit2, "try-error") && !is.na(summary(fit2)$r.squared)) {
+    bc <- coef(fit2)
+    return(list(
+      coef  = c(B1 = unname(ifelse("B1" %in% names(bc), bc["B1"], NA_real_)),
+                F1 = NA_real_),
+      adjr2 = summary(fit2)$adj.r.squared,
+      ok    = TRUE
+    ))
+  }
+  list(coef = c(B1 = NA_real_, F1 = NA_real_), adjr2 = NA_real_, ok = FALSE)
+}
+
+safe_alm <- function(F, F1, YY1) {
+  df <- data.frame(F = F, F1 = F1, YY1 = YY1)
+  if (nrow(df) < 2L) return(list(coef = c(F1 = NA_real_), adjr2 = NA_real_, ok = FALSE))
+  df <- df[-1, , drop = FALSE]
+  df <- df[is.finite(rowSums(df)), , drop = FALSE]
+  if (nrow(df) < 5L) return(list(coef = c(F1 = NA_real_), adjr2 = NA_real_, ok = FALSE))
+  fit <- try(lm(F ~ -1 + F1 + offset(YY1), data = df), silent = TRUE)
+  if (!inherits(fit, "try-error") && !is.na(summary(fit)$r.squared)) {
+    return(list(coef = c(F1 = unname(coef(fit)[1])), adjr2 = summary(fit)$adj.r.squared, ok = TRUE))
+  }
+  fit2 <- try(lm(F ~ -1 + F1, data = df), silent = TRUE)
+  if (!inherits(fit2, "try-error") && !is.na(summary(fit2)$r.squared)) {
+    return(list(coef = c(F1 = unname(coef(fit2)[1])), adjr2 = summary(fit2)$adj.r.squared, ok = TRUE))
+  }
+  list(coef = c(F1 = NA_real_), adjr2 = NA_real_, ok = FALSE)
+}
+
+#View(cann_data)
+run_autovl_single <- function(Date, Y, iterations = 10L) {
+  Y <- as.numeric(Y)
+  Y[!is.finite(Y)] <- 0
+  Y[Y < 0] <- 0
+  n <- length(Y)
+  if (n < 5L) stop("Not enough rows (>= 5 required).")
+  
+  Y1 <- shift(Y, 1)
+  Ylm <- tryCatch(lm(Y ~ -1 + Y1), error = function(e) NULL)
+  alpha_init <- if (!is.null(Ylm)) as.numeric(coef(Ylm)[1]) else NA_real_
+  alpha <- if (is.finite(alpha_init)) alpha_init else 0.95
+  
+  AN <- iterations
+  FlowMat <- matrix(NA_real_, nrow = n, ncol = AN)
+  Coef    <- matrix(NA_real_, nrow = AN, ncol = 6)
+  colnames(Coef) <- c("F_AR","F_adjR2","B_AR","B_MA","unused","B_adjR2")
+  alpha_seq <- rep(NA_real_, AN)
+  
+  for (jj in 1:AN) {
+    B <- new_filt(Y, alpha, 1.0)
+    F <- Y - B
+    
+    F1  <- shift(F, 1)
+    B1  <- shift(B, 1)
+    YY1 <- Y - shift(Y, 1)
+    
+    blm <- safe_blm(B, B1, F1)
+    alm <- safe_alm(F, F1, YY1)
+    
+    if (!blm$ok) {
+      blm$coef  <- c(B1 = ifelse(is.finite(Coef[max(1, jj - 1), 3]), Coef[max(1, jj - 1), 3], 0.95),
+                     F1 = 0.0)
+      blm$adjr2 <- NA_real_
+    }
+    if (!alm$ok) {
+      alm$coef  <- c(F1 = ifelse(is.finite(Coef[max(1, jj - 1), 1]), Coef[max(1, jj - 1), 1], 0.3))
+      alm$adjr2 <- NA_real_
+    }
+    
+    Coef[jj, 1] <- alm$coef["F1"]  # F_AR
+    Coef[jj, 2] <- alm$adjr2
+    Coef[jj, 3] <- blm$coef["B1"]  # B_AR
+    Coef[jj, 4] <- blm$coef["F1"]  # B_MA
+    Coef[jj, 6] <- blm$adjr2
+    
+    FlowMat[, jj] <- B
+    
+    alpha_raw <- max(Coef[jj, 1], Coef[jj, 3], na.rm = TRUE)
+    if (!is.finite(alpha_raw)) alpha_raw <- 0.95
+    alpha <- max(min(alpha_raw, 0.999), 0.60)
+    alpha_seq[jj] <- alpha
+  }
+  
+  B_final <- FlowMat[, AN]
+  F_final <- Y - B_final
+  BFI <- if (sum(Y) > 0) sum(B_final) / sum(Y) else NA_real_
+  
+  list(
+    flows = data.frame(Date = Date, TotalFlow = Y, Fastflow = F_final, Baseflow = B_final),
+    coef  = data.frame(Iteration = 1:AN, F_AR = Coef[,1], F_adjR2 = Coef[,2],
+                       B_AR = Coef[,3], B_MA = Coef[,4], B_adjR2 = Coef[,6],
+                       Alpha = alpha_seq),
+    iter  = { df <- data.frame(Date = Date, FlowMat); names(df)[-1] <- paste0("B_iter_", 1:AN); df },
+    diag  = data.frame(SeriesLength = n, Iterations = AN,
+                       AlphaInit = alpha_init, AlphaFinal = alpha, BFI = BFI)
+  )
+}
+
+#remove all na data
+#run with one or two states 
+#Water years or
+#function to split fast flow from baseflow
+fastflow<-function(catchment_id){
+  catchment_data <- extract_catchment_timeseries(combined, catchment_id)
+  #View(catchment_data)
+  catchment_Split<-run_autovl_single(Date=catchment_data$date,Y=catchment_data$flow_mm,iterations=10L)#runs auto vl and splits fast flow
+  #View(catchment_Split)
+  flow<-catchment_Split[["flows"]]
+  #View(flow)
+  flow_precip<-full_join(catchment_data,flow, by=c("date"="Date"))
+  #View(flow_precip)
+  return(flow_precip)
+}
+
+
+rain_5_day <- function(fastflow_data) {
+  fastflow_data <- fastflow_data %>%
+    arrange(date) %>%
+    mutate(precip_5day = zoo::rollsum(precip, k = 5, fill = NA, align = "right")) %>%
+    mutate(precip_5day = ifelse(abs(precip_5day) < 1e-10, 0, precip_5day))
+  
+  # Find max flow for each year and get corresponding 5-day precipitation
+  max_flow_precip <- fastflow_data %>%
+    mutate(year = year(date)) %>%
+    group_by(year) %>%
+    slice_max(Fastflow, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(year, flow = Fastflow, precipitation = precip_5day) %>%
+    arrange(year) %>%
+    filter(!is.na(flow), !is.na(precipitation), 
+           is.finite(flow), is.finite(precipitation),
+           flow > 0, precipitation > 0) 
+  
+  return(max_flow_precip %>% as.data.frame())
+}
+
+rain_3_day <- function(fastflow_data) {
+  fastflow_data <- fastflow_data %>%
+    arrange(date) %>%
+    mutate(precip_3day = zoo::rollsum(precip, k = 3, fill = NA, align = "right")) %>%
+    mutate(precip_3day = ifelse(abs(precip_3day) < 1e-10, 0, precip_3day))
+  
+  # Find max flow for each year and get corresponding 3-day precipitation
+  max_flow_3precip <- fastflow_data %>%
+    mutate(year = year(date)) %>%
+    group_by(year) %>%
+    slice_max(Fastflow, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(year, flow = Fastflow, precipitation = precip_3day) %>%
+    arrange(year) %>%
+    filter(!is.na(flow), !is.na(precipitation), 
+           is.finite(flow), is.finite(precipitation),
+           flow > 0, precipitation > 0)
+  
+  return(max_flow_3precip %>% as.data.frame())
+}
+
+max_daily_rain_before_peak <- function(fastflow_data) {
+  fastflow_data <- fastflow_data %>%
+    arrange(date)
+  
+  # Find the date of max flow for each year
+  max_flow_dates <- fastflow_data %>%
+    mutate(year = year(date)) %>%
+    group_by(year) %>%
+    slice_max(Fastflow, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(year, max_flow_date = date, max_daily_flow = Fastflow)
+  
+  # For each max flow date, find the max daily precip in the 5 days before
+  results <- max_flow_dates %>%
+    rowwise() %>%
+    mutate(
+      max_daily_precip_5day = {
+        five_day_precip <- fastflow_data %>%
+          filter(date <= max_flow_date & date > max_flow_date - days(5)) %>%
+          pull(precip)
+        if(length(five_day_precip) > 0) max(five_day_precip, na.rm = TRUE) else NA
+      }
+    ) %>%
+    ungroup() %>%
+    select(year, flow = max_daily_flow, precipitation = max_daily_precip_5day) %>%
+    arrange(year) %>%
+    filter(!is.na(flow), !is.na(precipitation),
+           is.finite(flow), is.finite(precipitation),
+           flow > 0, precipitation > 0)
+  
+  return(results %>% as.data.frame())
+}
+
+#Test
+test<-fastflow("408202")
+View(rain_5_day(test))
+
+#View(max_daily_rain_before_peak(test))
+#View(combined)
+hydro_model <- function(catchment_id){
+  
+  # STEP 1: Get fastflow data first
+  cat(sprintf("\n=== Processing catchment: %s ===\n", catchment_id))
+  fastflow_data <- fastflow(catchment_id)
+  
+  # STEP 2: Pass fastflow_data to the rain functions
+  five_day_data <- rain_5_day(fastflow_data)
+  three_day_data <- rain_3_day(fastflow_data)
+  max_daily_rain <- max_daily_rain_before_peak(fastflow_data)
+  
+  # Verify we have data frames
+  cat("Data types:\n")
+  cat("  five_day_data:", class(five_day_data), "\n")
+  cat("  three_day_data:", class(three_day_data), "\n")
+  cat("  max_daily_rain:", class(max_daily_rain), "\n")
+  
+  # Create list of datasets with names
+  data_list <- list(
+    "5-Day Rainfall" = five_day_data,
+    "3-Day Rainfall" = three_day_data,
+    "Max Daily Rainfall" = max_daily_rain
+  )
+  
+  model_states <- c(1, 2, 3)
+  
+  # Create a list to store all plots
+  all_plots <- list()
+  plot_counter <- 1
+  
+  # Your nested loop
+  for (data_name in names(data_list)){
+    catch_data <- data_list[[data_name]]
+    
+    cat(sprintf("\n=== Data type: %s ===\n", data_name))
+    cat("  Rows:", nrow(catch_data), "\n")
+    cat("  Columns:", paste(names(catch_data), collapse = ", "), "\n")
+    
+    for (n in model_states){
+      
+      cat(sprintf("\n=== Processing: %s | %d-State Model ===\n", data_name, n))
+      
+      # Add error handling
+      tryCatch({
+        Qpeak.model <- build(input.data = catch_data,
+                             #data.transform = 'boxcoc',
+                             parameters = c('a0','a1','std'),
+                             state.shift.parameters = c('a1','std'),
+                             error.distribution = 'truc.normal',
+                             transition.graph = matrix(TRUE, n, n))
+        
+        n_params <- length(c('a0','a1','std')) + length(c('a1','std')) * (n - 1)
+        
+        Qpeak.model <- fit.hydroState(Qpeak.model, 
+                                      pop.size.perParameter = 10, 
+                                      max.generations = 500, 
+                                      doParallel = FALSE)
+        
+        aic_value <- get.AIC(Qpeak.model)
+        cat(sprintf("AIC: %.2f\n", aic_value))
+        
+        # review residual plots
+        plot(Qpeak.model, pse.residuals = TRUE, siteID = catchment_id)
+        
+        # set the reference year to name the states
+        Qpeak.model <- setInitialYear(Qpeak.model, 1990)
+        
+        # plot all four plots
+        plot(Qpeak.model)
+        statesProb <- get.states(Qpeak.model)
+        
+        yearly_summary_states <- catch_data %>%
+          inner_join(statesProb, by = c("year" = "Year"))
+        
+        flood_state <- yearly_summary_states %>%
+          rename(state = `Viterbi State Number`)
+        
+        # Create state labels dynamically based on number of states
+        state_levels <- 1:n
+        if(n <= length(Qpeak.model@state.labels)){
+          state_labels <- Qpeak.model@state.labels[1:n]
+        } else {
+          state_labels <- paste("State", 1:n)
+        }
+        
+        flood_state$state_label <- factor(
+          flood_state$state,
+          levels = state_levels,
+          labels = state_labels
+        )
+        
+        # Create the plot with CORRECT column names
+        p <- ggplot(flood_state, aes(x = precipitation,
+                                     y = flow,
+                                     colour = state_label)) +
+          geom_point(size = 3, alpha = 0.7) +
+          geom_smooth(method = "lm", se = TRUE, linewidth = 1.2, linetype = "dashed", alpha = 0.2) +
+          labs(
+            title = sprintf("%s | %d-State Model", data_name, n),
+            subtitle = sprintf("Catchment: %s | AIC: %.1f", catchment_id, aic_value),
+            x = "Precipitation (mm)",
+            y = "Maximum Daily Flow (mm/d)",
+            colour = "Hydrological State"
+          ) +
+          theme_minimal(base_size = 12) +
+          theme(
+            plot.title = element_text(face = "bold", size = 14),
+            plot.subtitle = element_text(color = "gray40", size = 10),
+            legend.position = "right",
+            legend.background = element_rect(fill = "white", color = "gray80"),
+            panel.grid.minor = element_blank(),
+            panel.border = element_rect(fill = NA, color = "gray80")
+          )
+        
+        # Store plot
+# Create a structured name: "5day_state2", "3day_state3", etc.
+plot_key <- sprintf("%s_state_%d", gsub(" ", "", data_name), n)
+
+all_plots[[plot_key]] <- p
+        
+        # Print individual plot
+        print(p)
+        
+      }, error = function(e) {
+        cat(sprintf("  ERROR: %s\n", e$message))
+      })
+    }
+  }
+  
+  # Create a combined plot with all successful graphs
+  if(length(all_plots) > 0) {
+    cat("\n=== Creating combined plot of all 9 models ===\n")
+    
+    library(gridExtra)
+    library(grid)
+    
+    combined_plot <- grid.arrange(grobs = all_plots, ncol = 3, nrow = 3,
+                                  top = textGrob(
+                                    sprintf("Precipitation vs Flow Analysis - Catchment %s", catchment_id),
+                                    gp = gpar(fontsize = 16, fontface = "bold")
+                                  ))
+  }
+  
+  return(all_plots)
+}
+
+# Run the analysis
+plots <- hydro_model("408202")
+help("hydroState")
+
+annual_flow_summary <- function(catchment_id) {
+  combined %>%
+    filter(catchment == catchment_id) %>%
+    mutate(year = year(date)) %>%
+    group_by(year) %>%
+    summarise(
+      avg_flow = mean(flow_mm, na.rm = TRUE),
+      max_flow = max(flow_mm, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(year)
+}
+
+# Test
+View(annual_flow_summary("408202"))
+
